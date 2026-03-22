@@ -13,7 +13,7 @@ import ipdb
 from HypergraphConv import HypergraphConv
 from torch_geometric.nn import GCNConv
 from itertools import permutations
-# from torch_geometric.nn.pool.topk_pool import topk # 已注释以防版本兼容问题
+# from torch_geometric.nn.pool.topk_pool import topk
 from torch_geometric.nn import global_mean_pool as gap, global_max_pool as gmp, global_add_pool as gsp
 from torch_geometric.nn.inits import glorot
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
@@ -21,149 +21,6 @@ from torch_geometric.utils import add_self_loops
 from high_fre_conv import highConv
 from collections import Counter
 from clip import load
-
-# ==========================================
-# [升级版] KANLinear: LayerNorm + GELU
-# ==========================================
-class KANLinear(nn.Module):
-    def __init__(
-        self,
-        in_features,
-        out_features,
-        grid_size=5,        # 保持默认 5
-        spline_order=3,     # 保持默认 3
-        scale_noise=0.1,
-        scale_base=1.0,
-        scale_spline=1.0,
-        enable_standalone_scale_spline=True,
-        base_activation=torch.nn.GELU, # [关键修改] 使用 GELU
-        grid_eps=0.02,
-        grid_range=[-1, 1],
-    ):
-        super(KANLinear, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.grid_size = grid_size
-        self.spline_order = spline_order
-
-        h = (grid_range[1] - grid_range[0]) / grid_size
-        grid = (
-            (
-                torch.arange(-spline_order, grid_size + spline_order + 1) * h
-                + grid_range[0]
-            )
-            .expand(in_features, -1)
-            .contiguous()
-        )
-        self.register_buffer("grid", grid)
-
-        self.base_weight = nn.Parameter(torch.Tensor(out_features, in_features))
-        self.spline_weight = nn.Parameter(
-            torch.Tensor(out_features, in_features, grid_size + spline_order)
-        )
-        if enable_standalone_scale_spline:
-            self.spline_scaler = nn.Parameter(
-                torch.Tensor(out_features, in_features)
-            )
-
-        self.scale_noise = scale_noise
-        self.scale_base = scale_base
-        self.scale_spline = scale_spline
-        self.enable_standalone_scale_spline = enable_standalone_scale_spline
-        self.base_activation = base_activation()
-        self.grid_eps = grid_eps
-
-        # 输入归一化
-        self.layernorm = nn.LayerNorm(in_features)
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        torch.nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5) * self.scale_base)
-        with torch.no_grad():
-            noise = (
-                (
-                    torch.rand(self.grid_size + 1, self.in_features, self.out_features)
-                    - 1 / 2
-                )
-                * self.scale_noise
-                / self.grid_size
-            )
-            self.spline_weight.data.copy_(
-                (self.scale_spline if not self.enable_standalone_scale_spline else 1.0)
-                * self.curve2coeff(
-                    self.grid.T[self.spline_order : -self.spline_order],
-                    noise,
-                )
-            )
-            if self.enable_standalone_scale_spline:
-                torch.nn.init.constant_(self.spline_scaler, self.scale_spline)
-
-    def b_splines(self, x: torch.Tensor):
-        assert x.dim() == 2 and x.size(1) == self.in_features
-        grid: torch.Tensor = self.grid
-        x = x.unsqueeze(-1)
-        bases = ((x >= grid[:, :-1]) & (x < grid[:, 1:])).to(x.dtype)
-        for k in range(1, self.spline_order + 1):
-            bases = (
-                (x - grid[:, : -(k + 1)])
-                / (grid[:, k:-1] - grid[:, : -(k + 1)])
-                * bases[:, :, :-1]
-            ) + (
-                (grid[:, k + 1 :] - x)
-                / (grid[:, k + 1 :] - grid[:, 1:(-k)])
-                * bases[:, :, 1:]
-            )
-        assert bases.size() == (
-            x.size(0),
-            self.in_features,
-            self.grid_size + self.spline_order,
-        )
-        return bases
-
-    def curve2coeff(self, x: torch.Tensor, y: torch.Tensor):
-        A = self.b_splines(x).transpose(0, 1)
-        B = y.transpose(0, 1)
-        solution = torch.linalg.lstsq(A, B).solution
-        result = solution.permute(2, 0, 1)
-        return result.contiguous()
-
-    @property
-    def scaled_spline_weight(self):
-        return self.spline_weight * (
-            self.spline_scaler.unsqueeze(-1)
-            if self.enable_standalone_scale_spline
-            else 1.0
-        )
-
-    def forward(self, x: torch.Tensor):
-        x = self.layernorm(x)
-        assert x.dim() == 2 and x.size(1) == self.in_features
-        base_output = F.linear(self.base_activation(x), self.base_weight)
-        spline_output = F.linear(
-            self.b_splines(x).view(x.size(0), -1),
-            self.scaled_spline_weight.view(self.out_features, -1),
-        )
-        return base_output + spline_output
-
-# ==========================================
-# [策略一] Bottleneck KAN (作为组件保留)
-# ==========================================
-class BottleneckKAN(nn.Module):
-    def __init__(self, in_dim, out_dim, latent_dim=32, kan_hidden=16, grid_size=5):
-        super(BottleneckKAN, self).__init__()
-        self.compress = nn.Linear(in_dim, latent_dim)
-        self.ln = nn.LayerNorm(latent_dim)
-        self.kan = KANLinear(latent_dim, kan_hidden, grid_size=grid_size, base_activation=torch.nn.GELU)
-        self.expand = nn.Linear(kan_hidden, out_dim)
-        
-    def forward(self, x):
-        x = self.compress(x)
-        x = self.ln(x)
-        x = self.kan(x)
-        x = self.expand(x)
-        return x
-
 class STEFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input):
@@ -232,11 +89,25 @@ class PositionalEncoding(nn.Module):
         return self.dropout(tmpx)
 
 class HyperGCN(nn.Module):
-    def __init__(self, a_dim, v_dim, l_dim, n_dim, nlayers, nhidden, nclass, dropout, lamda, alpha, variant, return_feature, use_residue, 
-                new_graph='full',n_speakers=2, modals=['a','v','l'], use_speaker=True, use_modal=False, num_L=3, num_K=4):
+    def __init__(self, a_dim, v_dim, l_dim, n_dim, nlayers, nhidden, nclass,
+             dropout, lamda, alpha, variant, return_feature, use_residue,
+             window_p=10, window_f=10,
+             new_graph='full', n_speakers=2, modals=['a', 'v', 'l'],
+             use_speaker=True, use_modal=False, num_L=3, num_K=4,
+             dataset_name='IEMOCAP'):
+
         super(HyperGCN, self).__init__()
-        self.return_feature = return_feature  #True
+        
+        self.dataset_name = dataset_name
+        # self.utt_fc = nn.Linear(self.hid_dim * 3, self.hid_dim)
+        # 改了后
+        # self.utt_fc = nn.Linear(nhidden * 3, nhidden)
+        self.utt_fc = nn.LazyLinear(nhidden)
+
+        self.return_feature = return_feature
         self.use_residue = use_residue
+        self.window_p = window_p
+        self.window_f = window_f
         self.new_graph = new_graph
         self.act_fn = nn.ReLU()
         self.dropout = dropout
@@ -248,27 +119,177 @@ class HyperGCN(nn.Module):
         self.use_speaker = use_speaker
         self.use_modal = use_modal
         self.use_position = False
-        
-        # [策略一应用] 特征投影层使用 Bottleneck KAN
-        # 将输入特征 (e.g. 1024) 压缩到 64，经 KAN 处理后，再扩展到 nhidden (512)
-        print(f"Initializing HyperGCN with Bottleneck KAN: In({n_dim}) -> Compress(64) -> KAN -> Expand({nhidden})")
-        self.fc1 = BottleneckKAN(n_dim, nhidden, latent_dim=64, kan_hidden=64, grid_size=5)     
-        
-        self.num_L =  num_L
-        self.num_K =  num_K
+
+        self.fc1 = nn.Linear(n_dim, nhidden)
+        self.num_L = num_L
+        self.num_K = num_K
+        self.layer_weights = nn.Parameter(torch.zeros(self.num_K))
+        self.beta = nn.Parameter(torch.tensor(0.0))
+
         for ll in range(num_L):
-            setattr(self,'hyperconv%d' %(ll+1), HypergraphConv(nhidden, nhidden))
+            setattr(self, 'hyperconv%d' % (ll + 1), HypergraphConv(nhidden, nhidden))
+
         self.act_fn = nn.ReLU()
-        # self.hyperedge_weight = nn.Parameter(torch.ones(1000))
-        # self.EW_weight = nn.Parameter(torch.ones(5200))
+        self.hyperedge_weight = nn.Parameter(torch.ones(1000))
+        self.EW_weight = nn.Parameter(torch.ones(5200))
         self.hyperedge_attr1 = nn.Parameter(torch.rand(nhidden))
         self.hyperedge_attr2 = nn.Parameter(torch.rand(nhidden))
-        #nn.init.xavier_uniform_(self.hyperedge_attr1)
+
         for kk in range(num_K):
-            setattr(self,'conv%d' %(kk+1), highConv(nhidden, nhidden))
-        #self.conv = highConv(nhidden, nhidden)
+            setattr(self, 'conv%d' % (kk + 1), highConv(nhidden, nhidden))
+
         corruption = "node_shuffle"
         self.corruption = getattr(self, "_%s" % corruption)
+
+    def _build_window_edges(self, nodes):
+        """
+        nodes: list[int]，按时间顺序排列的节点 id
+        return: list[(src, dst)]，不含自环
+        """
+        edges = []
+        T = len(nodes)
+
+        for t in range(T):
+            left = max(0, t - self.window_p)
+            right = min(T - 1, t + self.window_f)
+            src = nodes[t]
+
+            for j in range(left, right + 1):
+                if j == t:
+                    continue
+                dst = nodes[j]
+                edges.append((src, dst))
+
+        return edges
+        # 
+    def build_utterance_features(self, a, v, l):
+        if self.dataset_name == 'MELD':
+            u = l
+        else:
+            u = torch.cat([l, a, v], dim=-1)
+
+        u = self.utt_fc(u)
+        return u
+        # 新增一个函数，构建 utterance-level GNN 的边索引
+    # def create_utterance_gnn_index(self, u, l, dia_len, spk_idx):
+    #     node_count = 0
+    #     index = []
+
+    #     for dlen in dia_len:
+
+    #         # 构建当前对话的节点
+    #         nodes = list(range(dlen))
+    #         nodes = [n + node_count for n in nodes]
+
+    #         # ===== window edges =====
+    #         index += self._build_window_edges(nodes)
+
+    #         # ===== speaker edges (ELR) =====
+    #         spk = spk_idx[node_count: node_count + dlen]
+
+    #         for i in range(dlen):
+    #             for j in range(dlen):
+    #                 if i != j and spk[i] == spk[j]:
+    #                     index.append((nodes[i], nodes[j]))
+
+    #         # ===== long-distance edges =====
+    #         feats = u[node_count: node_count + dlen]
+    #         index += self._build_long_range_edges(feats, nodes, topk=1)
+
+    #         node_count += dlen
+
+
+    #     if len(index) > 0:
+    #         edge_index = torch.LongTensor(index).t().contiguous().cuda()
+    #     else:
+    #         edge_index = torch.empty((2, 0), dtype=torch.long).cuda()
+
+    #     return edge_index
+    def create_utterance_gnn_index(self, u, l, dia_len, spk_idx):
+        node_count = 0
+        index = []
+
+        for dlen in dia_len:
+            # 当前对话节点
+            nodes = list(range(dlen))
+            nodes = [n + node_count for n in nodes]
+
+            # ===== 所有数据集都保留：window edges =====
+            index += self._build_window_edges(nodes)
+
+            # ===== 所有数据集都保留：speaker edges =====
+            spk = spk_idx[node_count: node_count + dlen]
+            for i in range(dlen):
+                for j in range(i + 1, dlen):
+                    if spk[i] == spk[j]:
+                        index.append((nodes[i], nodes[j]))
+
+
+            # ===== 只给 IEMOCAP 加 long-range =====
+            if self.dataset_name == 'IEMOCAP':
+                feats = u[node_count: node_count + dlen]
+                index += self._build_long_range_edges(feats, nodes, topk=1)
+
+            # ===== MELD 先不加 long-range =====
+            elif self.dataset_name == 'MELD':
+                # feats = u[node_count: node_count + dlen]
+                # index += self._build_long_range_edges(feats, nodes, topk=2)
+                pass
+            node_count += dlen
+
+        device = u.device
+        if len(index) > 0:
+            edge_index = torch.LongTensor(index).t().contiguous().to(device)
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long).to(device)
+
+        return edge_index
+
+        # 新增一个函数，将 utterance-level 的特征扩展到对应的模态节点上，供后续计算相似度矩阵和信息熵时使用
+    # ===== ELR ADDITION =====
+    # 新增一个函数，构建 long-range 边，基于特征相似度选择 top-k 相关节点连接
+    def _build_long_range_edges(self, feats, nodes, topk=3):
+        """
+        feats: 当前对话的特征 [T, D]
+        nodes: 对应节点id
+        """
+
+        if feats.size(0) <= 1:
+            return []
+
+        feats = F.normalize(feats, p=2, dim=-1)
+        sim = torch.matmul(feats, feats.t())
+
+        edges = []
+        T = sim.size(0)
+
+        for i in range(T):
+
+            sim_i = sim[i].clone()
+            sim_i[i] = -1e9
+
+            k = min(topk, T - 1)
+
+            _, idx = torch.topk(sim_i, k=k)
+
+            for j in idx.tolist():
+
+                edges.append((nodes[i], nodes[j]))
+                edges.append((nodes[j], nodes[i]))
+
+        return edges
+
+    def expand_utterance_to_modal_nodes(self, utt_out, dia_len):
+        expanded = []
+        start = 0
+
+        for dlen in dia_len:
+            cur = utt_out[start:start + dlen]      # [dlen, D]
+            cur_expand = torch.cat([cur, cur, cur], dim=0)  # [3*dlen, D]
+            expanded.append(cur_expand)
+            start += dlen
+
+        return torch.cat(expanded, dim=0)
 
     def _node_shuffle(self, X):
         perm = torch.randperm(X.size(0))
@@ -276,20 +297,12 @@ class HyperGCN(nn.Module):
         return neg_X
 
     def utterance_selector(self, key, context):
-        '''
-        Our
-        :param key: (dim)
-        :param context: (utts, dim)
-        :return:(utts)
-        '''
-        s1 = torch.einsum("bu,u->b", context, key)/(1e-6 + torch.norm(context, dim=-1) * torch.norm(key, dim=-1, keepdim=True)) # 对应论文中公式(4):语义相关向量,list 类型
+        s1 = torch.einsum("bu,u->b", context, key) / (
+            1e-6 + torch.norm(context, dim=-1) * torch.norm(key, dim=-1, keepdim=True)
+        )
         return s1
 
-    def utterance_selector_2(self, a, b): 
-        """
-            Computes the cosine similarity cos_sim(a[i], b[j]) for all i and j.
-            :return: Matrix with res[i][j]  = cos_sim(a[i], b[j])
-        """
+    def utterance_selector_2(self, a, b):
         if not isinstance(a, torch.Tensor):
             a = torch.tensor(a)
 
@@ -307,39 +320,9 @@ class HyperGCN(nn.Module):
         return (a_norm * b_norm).sum(-1)
 
     def get_batch_entropy(self, tokens):
-        '''
-        :param tokens: (batch, utts, tokens) utts, tokens都不等长
-        :return:
-        '''
         dia_entro = []
         for batch_index, data in enumerate(tokens):
-            dia_tokens = [token for st in data for token in st]  # 对话中所有token列表
-            length = len(dia_tokens)
-            tokens_dicts = Counter(dia_tokens)
-            entro = []
-            for utt in data:  # 每句话
-                shanno = 0
-                for token in utt:  # 每句话中的每个词
-                    prob = tokens_dicts[token] / length
-                    shanno -= prob * math.log(prob, 2)  # 信息熵，对应论文中的公式(6)
-                entro.append(shanno)  # 这个对话的信息熵已添加
-                entro.append(shanno)
-                entro.append(shanno)
-            dia_entro.append(torch.Tensor(entro))
-        # batch_entro = pad_sequence(dia_entro, batch_first=True, padding_value=0)  # 用于将长度不一的序列（例如张量列表）填充到相同的长度
-        # 使用 torch.cat 将张量列表连接成一个更大的张量
-        batch_entro = torch.cat(dia_entro, dim=0)
-
-        return batch_entro
-
-    def get_batch_entropy_1(self, tokens):
-        '''
-        :param tokens: (batch, utts, tokens) utts, tokens都不等长
-        :return:
-        '''
-        dia_entro = []
-        for batch_index, data in enumerate(tokens):
-            dia_tokens = [token for st in data for token in st]  # 对话中所有token列表
+            dia_tokens = [token for st in data for token in st]
             length = len(dia_tokens)
             tokens_dicts = Counter(dia_tokens)
             entro = []
@@ -347,21 +330,44 @@ class HyperGCN(nn.Module):
                 shanno = 0
                 for token in utt:
                     prob = tokens_dicts[token] / length
-                    shanno -= prob * math.log(prob, 2)  # 信息熵，对应论文中的公式(6)
-                entro.append(shanno)  # 这个对话的信息熵已添加
+                    shanno -= prob * math.log(prob, 2)
+                entro.append(shanno)
+                entro.append(shanno)
+                entro.append(shanno)
             dia_entro.append(torch.Tensor(entro))
-        # batch_entro = pad_sequence(dia_entro, batch_first=True, padding_value=0)
+
+        batch_entro = torch.cat(dia_entro, dim=0)
+        return batch_entro
+
+    def get_batch_entropy_1(self, tokens):
+        dia_entro = []
+        for batch_index, data in enumerate(tokens):
+            dia_tokens = [token for st in data for token in st]
+            length = len(dia_tokens)
+            tokens_dicts = Counter(dia_tokens)
+            entro = []
+            for utt in data:
+                shanno = 0
+                for token in utt:
+                    prob = tokens_dicts[token] / length
+                    shanno -= prob * math.log(prob, 2)
+                entro.append(shanno)
+            dia_entro.append(torch.Tensor(entro))
+
         batch_entro = torch.cat(dia_entro, dim=0)
         return batch_entro
 
     def forward(self, a, v, l, dia_len, qmask, epoch, Sentence):
+
         num_modality = len(self.modals)
-        qmask = torch.cat([qmask[:x,i,:] for i,x in enumerate(dia_len)],dim=0)
+        qmask = torch.cat([qmask[:x, i, :] for i, x in enumerate(dia_len)], dim=0)
         spk_idx = torch.argmax(qmask, dim=-1)
         spk_emb_vector = self.speaker_embeddings(spk_idx)
+
         if self.use_speaker:
             if 'l' in self.modals:
                 l += spk_emb_vector
+
         if self.use_position:
             if 'l' in self.modals:
                 l = self.l_pos(l, dia_len)
@@ -369,7 +375,8 @@ class HyperGCN(nn.Module):
                 a = self.a_pos(a, dia_len)
             if 'v' in self.modals:
                 v = self.v_pos(v, dia_len)
-        if self.use_modal:  
+
+        if self.use_modal:
             emb_idx = torch.LongTensor([0, 1, 2]).cuda()
             emb_vector = self.modal_embeddings(emb_idx)
 
@@ -380,95 +387,120 @@ class HyperGCN(nn.Module):
             if 'l' in self.modals:
                 l += emb_vector[2].reshape(1, -1).expand(l.shape[0], l.shape[1])
 
-        '''Hyper GCN'''
-        hyperedge_index, edge_index, features, batch, hyperedge_type1 = self.create_hyper_index(a, v, l, dia_len, self.modals)
-        
-        # [KAN 使用]
-        # KANLinear 自动处理非线性变换，替代了之前的 nn.Linear
-        x1 = self.fc1(features)  
-        
-        num_edges = hyperedge_index.size(1)
-        if num_edges == 0:
-            return out1, out2, out3, out4  # 或直接跳过超图分支
-        max_edge_id = hyperedge_index[1].max().item() + 1
-        weight = features.new_ones(max_edge_id)
-        EW_weight = features.new_ones(num_edges)
+        # ---------------- Hyper GCN ----------------
+        hyperedge_index, edge_index, features, batch, hyperedge_type1 = self.create_hyper_index(
+            a, v, l, dia_len, self.modals
+        )
+        x1 = self.fc1(features)
+        weight = self.hyperedge_weight[0:hyperedge_index[1].max().item() + 1]
+        EW_weight = self.EW_weight[0:hyperedge_index.size(1)]
 
-        edge_attr = self.hyperedge_attr1*hyperedge_type1 + self.hyperedge_attr2*(1-hyperedge_type1)
+        edge_attr = self.hyperedge_attr1 * hyperedge_type1 + self.hyperedge_attr2 * (1 - hyperedge_type1)
         out = x1
         for ll in range(self.num_L):
-            out = getattr(self,'hyperconv%d' %(ll+1))(out, hyperedge_index, weight, edge_attr, EW_weight, dia_len)             
-        if self.use_residue:
-            out1 = torch.cat([features, out], dim=-1)                                   
-        #out1 = self.reverse_features(dia_len, out1)
+            out = getattr(self, 'hyperconv%d' % (ll + 1))(
+                out, hyperedge_index, weight, edge_attr, EW_weight, dia_len
+            )
+        # ---------------- 话语级 GNN 分支 ----------------
+        # 将多模态表示聚合为每个 utterance 的节点特征
+        u = self.build_utterance_features(a, v, l)
+        # 构建话语图边：同说话人邻接 + 滑动窗口时序边
+        utt_edge_index = self.create_utterance_gnn_index(u, l, dia_len, spk_idx)
 
-        '''High GCN'''
-        gnn_edge_index, gnn_features = self.create_gnn_index(a, v, l, dia_len, self.modals)
-        gnn_out = x1
+        # 在话语图上进行 K 层残差式图卷积更新，并保存每层输出
+        utt_out = u
+        utt_layer_outputs = []
+
         for kk in range(self.num_K):
-            gnn_out = gnn_out + getattr(self,'conv%d' %(kk+1))(gnn_out,gnn_edge_index)
-        # neg_gnn_out = self.corruption(gnn_out) # 负样本
-        out2 = torch.cat([out,gnn_out], dim=1)
-        # neg_out2 = torch.cat([neg_out,neg_gnn_out], dim=1)
+            utt_out = utt_out + getattr(self, 'conv%d' % (kk + 1))(utt_out, utt_edge_index)
+            utt_layer_outputs.append(utt_out)
+
+        # 层加权融合
+        stacked_h = torch.stack(utt_layer_outputs, dim=0)   # [K, N, D]
+        alpha = torch.softmax(self.layer_weights, dim=0)    # [K]
+        alpha = alpha.view(-1, 1, 1)
+
+        agg_h = (alpha * stacked_h).sum(dim=0)              # [N, D]
+        last_h = utt_layer_outputs[-1]
+        beta = torch.sigmoid(self.beta)
+
+        utt_out = beta * last_h + (1 - beta) * agg_h
+
+        # 将 utterance 节点表示扩展回模态节点粒度，与超图分支对齐
+        utt_out = self.expand_utterance_to_modal_nodes(utt_out, dia_len)
+        # 融合超图分支(out)与话语图分支(utt_out)特征
+        out2 = torch.cat([out, utt_out], dim=1)
+
+        # gnn_edge_index, gnn_features = self.create_gnn_index(a, v, l, dia_len, self.modals)
+        # gnn_edge_index, gnn_features = self.create_gnn_index(a, v, l, dia_len, self.modals)
+        # gnn_out = x1
+        # for kk in range(self.num_K):
+        #     gnn_out = gnn_out + getattr(self, 'conv%d' % (kk + 1))(gnn_out, gnn_edge_index)
+
+        # out2 = torch.cat([out, gnn_out], dim=1)
         if self.use_residue:
             out2 = torch.cat([features, out2], dim=-1)
-            # out2 = torch.cat([features, gnn_out], dim=-1)
-            # neg_out2 = torch.cat([features, neg_out2], dim=-1)
-        out1 = self.reverse_features(dia_len, out2)
+
+        # 主输出和辅助输出保持同维度，避免分类头输入不一致
+        out1 = out2
+
+        out1 = self.reverse_features(dia_len, out1)
         out2 = self.reverse_features(dia_len, out2)
 
-        '''相似度矩阵：context filter s1'''
-        utt_len = x1.size()[0]
-        score1, scoreall = [], []
+        # ---------------- 相似度矩阵分支 ----------------
+        gnn_edge_index = utt_edge_index
+        utt_len = u.size(0)
+        score1 = []
+
         for index in range(utt_len):
-            key = x1[index, :]  # ":"表示选取该维度的所有元素，即选择该维度上的全部数据。 [512]
-            s1 = self.utterance_selector(key, x1)  # 当前话语上下文相似度 [utt_len*3]
-            s1 = s1.unsqueeze(1)
-            s1 = s1.t()
-            score1.append(s1)  # list类型：[utt_len*3]
-        s1 = torch.cat(score1, dim=0)  # [utt_len*3, utt_len*3]
-        edge_index1 = (s1 > 0).nonzero(as_tuple=False).t().contiguous()  # torch.Size([2, 4604671])
-        # 计算归一化的注意力权重，可以使用 softmax 函数
-        attention_weights = F.softmax(s1, dim=1)  # 在维度1上应用 softmax
-        weighted_features = torch.matmul(attention_weights, x1)  # 注意力权重矩阵与特征矩阵相乘
+            key = x1[index, :]
+            s1 = self.utterance_selector(key, x1)
+            s1 = s1.unsqueeze(0)
+            score1.append(s1)
+
+        s1 = torch.cat(score1, dim=0)
+        attention_weights = F.softmax(s1, dim=1)
+        weighted_features = torch.matmul(attention_weights, x1)
 
         gnn_out_2 = weighted_features
         for kk in range(self.num_K):
             gnn_out_2 = gnn_out_2 + getattr(self, 'conv%d' % (kk + 1))(gnn_out_2, gnn_edge_index)
 
-        out3 = torch.cat([out, gnn_out_2], dim=1) 
+        gnn_out_2 = self.expand_utterance_to_modal_nodes(gnn_out_2, dia_len)
+
+        out3 = torch.cat([out, gnn_out_2], dim=1)
         if self.use_residue:
             out3 = torch.cat([features, out3], dim=-1)
-
         out3 = self.reverse_features(dia_len, out3)
 
-        '''信息熵: 用Sentence来进行计算'''
-        device = gnn_features.device
-        # print(len(Sentence)) # BN大小
-        if num_modality == 3:
-            s2 = self.get_batch_entropy(Sentence).to(device)
-            # 计算归一化的注意力权重，可以使用 softmax 函数
-            attention_weights = F.softmax(s2, dim=0)  # 在维度0上应用 softmax
-            # 将注意力权重应用于特征向量
-            weighted_features = attention_weights.unsqueeze(-1) * x1  
-        elif num_modality == 1:
-            s2 = self.get_batch_entropy_1(Sentence).to(device)
-            # 计算归一化的注意力权重，可以使用 softmax 函数
-            attention_weights = F.softmax(s2, dim=0)  # 在维度0上应用 softmax
-            # 将注意力权重应用于特征向量
-            weighted_features = attention_weights.unsqueeze(-1) * x1
-        gnn_out_3 = weighted_features
-        for kk in range(self.num_K):
-            gnn_out_3 = gnn_out_3 + getattr(self, 'conv%d' % (kk + 1))(gnn_out_3, gnn_edge_index)
-        out4 = torch.cat([weighted_features, gnn_out_3], dim=1) 
+        # ---------------- 信息熵分支 ----------------
+        # device = gnn_features.device
+        if self.dataset_name == 'MELD':
+            out4 = out1
+        else:
+            device = x1.device
 
-        if self.use_residue:
-            out4 = torch.cat([features, out4], dim=-1)
-        out4 = self.reverse_features(dia_len, out4)
+            if num_modality == 3:
+                s2 = self.get_batch_entropy(Sentence).to(device)
+                attention_weights = F.softmax(s2, dim=0)
+                weighted_features = attention_weights.unsqueeze(-1) * x1
+            elif num_modality == 1:
+                s2 = self.get_batch_entropy_1(Sentence).to(device)
+                attention_weights = F.softmax(s2, dim=0)
+                weighted_features = attention_weights.unsqueeze(-1) * x1
+            else:
+                weighted_features = x1
+
+            gnn_out_3 = weighted_features
+            for kk in range(self.num_K):
+                gnn_out_3 = gnn_out_3 + getattr(self, 'conv%d' % (kk + 1))(gnn_out_3, gnn_edge_index)
+
+            out4 = torch.cat([weighted_features, gnn_out_3], dim=1)
+            if self.use_residue:
+                out4 = torch.cat([features, out4], dim=-1)
+            out4 = self.reverse_features(dia_len, out4)
 
         return out1, out2, out3, out4
-        
-
 
     def create_hyper_index(self, a, v, l, dia_len, modals):
         self_loop = False
@@ -483,27 +515,31 @@ class HyperGCN(nn.Module):
         edge_type = torch.zeros(0).cuda()
         in_index0 = torch.zeros(0).cuda()
         hyperedge_type1 = []
+
         for i in dia_len:
             nodes = list(range(i * num_modality))
             nodes = [j + node_count for j in nodes]
             nodes_l = nodes[0:i * num_modality // 3]
             nodes_a = nodes[i * num_modality // 3:i * num_modality * 2 // 3]
             nodes_v = nodes[i * num_modality * 2 // 3:]
+
             index1 = index1 + nodes_l + nodes_a + nodes_v
             for _ in range(i):
                 index1 = index1 + [nodes_l[_]] + [nodes_a[_]] + [nodes_v[_]]
+
             for _ in range(i + 3):
                 if _ < 3:
                     index2 = index2 + [edge_count] * i
                 else:
                     index2 = index2 + [edge_count] * 3
                 edge_count = edge_count + 1
+
             if node_count == 0:
-                ll = l[0:0 + i]
-                aa = a[0:0 + i]
-                vv = v[0:0 + i]
+                ll = l[0:i]
+                aa = a[0:i]
+                vv = v[0:i]
                 features = torch.cat([ll, aa, vv], dim=0)
-                temp = 0 + i
+                temp = i
             else:
                 ll = l[temp:temp + i]
                 aa = a[temp:temp + i]
@@ -516,11 +552,14 @@ class HyperGCN(nn.Module):
             Gnodes.append(nodes_l)
             Gnodes.append(nodes_a)
             Gnodes.append(nodes_v)
+
             for _ in range(i):
-                Gnodes.append([nodes_l[_]] + [nodes_a[_]] + [nodes_v[_]])
+                Gnodes.append([nodes_l[_], nodes_a[_], nodes_v[_]])
+
             for ii, _ in enumerate(Gnodes):
                 perm = list(permutations(_, 2))
                 tmp = tmp + perm
+
             batch = batch + [batch_count] * i * 3
             batch_count = batch_count + 1
             hyperedge_type1 = hyperedge_type1 + [1] * i + [0] * 3
@@ -530,75 +569,177 @@ class HyperGCN(nn.Module):
         index1 = torch.LongTensor(index1).view(1, -1)
         index2 = torch.LongTensor(index2).view(1, -1)
         hyperedge_index = torch.cat([index1, index2], dim=0).cuda()
+
         if self_loop:
             max_edge = hyperedge_index[1].max()
             max_node = hyperedge_index[0].max()
-            loops = torch.cat([torch.arange(0, max_node + 1, 1).repeat_interleave(2).view(1, -1),
-                               torch.arange(max_edge + 1, max_edge + 1 + max_node + 1, 1).repeat_interleave(2).view(1,
-                                                                                                                    -1)],
-                              dim=0).cuda()
+            loops = torch.cat([
+                torch.arange(0, max_node + 1, 1).repeat_interleave(2).view(1, -1),
+                torch.arange(max_edge + 1, max_edge + 1 + max_node + 1, 1).repeat_interleave(2).view(1, -1)
+            ], dim=0).cuda()
             hyperedge_index = torch.cat([hyperedge_index, loops], dim=1)
 
         edge_index = torch.LongTensor(tmp).T.cuda()
         batch = torch.LongTensor(batch).cuda()
-
         hyperedge_type1 = torch.LongTensor(hyperedge_type1).view(-1, 1).cuda()
-
 
         return hyperedge_index, edge_index, features, batch, hyperedge_type1
 
-    def create_gnn_index(self, a, v, l, dia_len, modals):
-        self_loop = False
-        num_modality = len(modals)
-        node_count = 0
-        batch_count = 0
-        index =[]
-        tmp = []
-        for i in dia_len:
-            nodes = list(range(i * num_modality))
-            nodes = [j + node_count for j in nodes]
-            nodes_l = nodes[0:i * num_modality // 3]
-            nodes_a = nodes[i * num_modality // 3:i * num_modality * 2 // 3]
-            nodes_v = nodes[i * num_modality * 2 // 3:]
-            index = index + list(permutations(nodes_l, 2)) + list(permutations(nodes_a, 2)) + list(
-                permutations(nodes_v, 2))
-            Gnodes = []
-            for _ in range(i):
-                Gnodes.append([nodes_l[_]] + [nodes_a[_]] + [nodes_v[_]])
-            for ii, _ in enumerate(Gnodes):
-                tmp = tmp + list(permutations(_, 2))
-            if node_count == 0:
-                ll = l[0:0 + i]
-                aa = a[0:0 + i]
-                vv = v[0:0 + i]
-                features = torch.cat([ll, aa, vv], dim=0)
-                temp = 0 + i
-            else:
-                ll = l[temp:temp + i]
-                aa = a[temp:temp + i]
-                vv = v[temp:temp + i]
-                features_temp = torch.cat([ll, aa, vv], dim=0)
-                features = torch.cat([features, features_temp], dim=0)
-                temp = temp + i
-            node_count = node_count + i * num_modality
-        edge_index = torch.cat([torch.LongTensor(index).T, torch.LongTensor(tmp).T], 1).cuda()
+    # # 新增这个函数
+    # def _build_long_range_edges(self, feats, nodes, topk=3):
+    #     if feats.size(0) <= 1:
+    #         return []
 
-        return edge_index, features
+    #     feats = F.normalize(feats, p=2, dim=-1)
+    #     sim = torch.matmul(feats, feats.t())
+
+    #     edges = []
+    #     T = sim.size(0)
+
+    #     for i in range(T):
+    #         sim_i = sim[i].clone()
+    #         sim_i[i] = -1e9
+    #         k = min(topk, T - 1)
+    #         _, idx = torch.topk(sim_i, k=k)
+
+    #         for j in idx.tolist():
+    #             edges.append((nodes[i], nodes[j]))
+    #             edges.append((nodes[j], nodes[i]))  # 双向边
+
+    #     return edges
+
+
+    # def create_gnn_index(self, a, v, l, dia_len, modals):
+    #     num_modality = len(modals)
+    #     node_count = 0
+    #     index = []
+    #     tmp = []
+
+    #     for i in dia_len:
+    #         nodes = list(range(i * num_modality))
+    #         nodes = [j + node_count for j in nodes]
+
+    #         nodes_l = nodes[0:i * num_modality // 3]
+    #         nodes_a = nodes[i * num_modality // 3:i * num_modality * 2 // 3]
+    #         nodes_v = nodes[i * num_modality * 2 // 3:]
+
+    #         # 同模态：滑动窗口边
+    #         index += self._build_window_edges(nodes_l)
+    #         index += self._build_window_edges(nodes_a)
+    #         index += self._build_window_edges(nodes_v)
+
+    #         # 同一 utterance 的跨模态边
+    #         Gnodes = []
+    #         for t in range(i):
+    #             Gnodes.append([nodes_l[t], nodes_a[t], nodes_v[t]])
+
+    #         for group in Gnodes:
+    #             tmp += list(permutations(group, 2))
+
+    #         if node_count == 0:
+    #             ll = l[0:i]
+    #             aa = a[0:i]
+    #             vv = v[0:i]
+    #             features = torch.cat([ll, aa, vv], dim=0)
+    #             temp = i
+    #         else:
+    #             ll = l[temp:temp + i]
+    #             aa = a[temp:temp + i]
+    #             vv = v[temp:temp + i]
+    #             features_temp = torch.cat([ll, aa, vv], dim=0)
+    #             features = torch.cat([features, features_temp], dim=0)
+    #             temp = temp + i
+
+    #         node_count = node_count + i * num_modality
+
+    #     # 更稳的 edge_index 构造，避免空边时报错
+    #     if len(index) > 0:
+    #         intra_edges = torch.LongTensor(index).t().contiguous()
+    #     else:
+    #         intra_edges = torch.empty((2, 0), dtype=torch.long)
+
+    #     if len(tmp) > 0:
+    #         cross_edges = torch.LongTensor(tmp).t().contiguous()
+    #     else:
+    #         cross_edges = torch.empty((2, 0), dtype=torch.long)
+
+    #     edge_index = torch.cat([intra_edges, cross_edges], dim=1).cuda()
+
+    #     return edge_index, features
+    
+    # def create_gnn_index(self, a, v, l, dia_len, modals):
+    #     num_modality = len(modals)
+    #     node_count = 0
+    #     index = []
+    #     tmp = []
+
+    #     temp = 0
+
+    #     for i in dia_len:
+    #         nodes = list(range(i * num_modality))
+    #         nodes = [j + node_count for j in nodes]
+
+    #         nodes_l = nodes[0:i * num_modality // 3]
+    #         nodes_a = nodes[i * num_modality // 3:i * num_modality * 2 // 3]
+    #         nodes_v = nodes[i * num_modality * 2 // 3:]
+
+    #         # 当前对话对应的特征
+    #         ll = l[temp:temp + i]
+    #         aa = a[temp:temp + i]
+    #         vv = v[temp:temp + i]
+
+    #         # 同模态：滑动窗口边
+    #         index += self._build_window_edges(nodes_l)
+    #         index += self._build_window_edges(nodes_a)
+    #         index += self._build_window_edges(nodes_v)
+
+    #         # 同模态：long-range 边
+    #         index += self._build_long_range_edges(ll, nodes_l, topk=3)
+    #         index += self._build_long_range_edges(aa, nodes_a, topk=3)
+    #         index += self._build_long_range_edges(vv, nodes_v, topk=3)
+
+    #         # 同一 utterance 的跨模态边
+    #         Gnodes = []
+    #         for t in range(i):
+    #             Gnodes.append([nodes_l[t], nodes_a[t], nodes_v[t]])
+
+    #         for group in Gnodes:
+    #             tmp += list(permutations(group, 2))
+
+    #         temp += i
+    #         node_count += i * num_modality
+
+    #     if len(index) > 0:
+    #         intra_edges = torch.LongTensor(index).t().contiguous()
+    #     else:
+    #         intra_edges = torch.empty((2, 0), dtype=torch.long)
+
+    #     if len(tmp) > 0:
+    #         cross_edges = torch.LongTensor(tmp).t().contiguous()
+    #     else:
+    #         cross_edges = torch.empty((2, 0), dtype=torch.long)
+
+    #     device = l.device
+    #     edge_index = torch.cat([intra_edges, cross_edges], dim=1).to(device)
+
+    #     return edge_index
 
     def reverse_features(self, dia_len, features):
-        l=[]
-        a=[]
-        v=[]
+        l = []
+        a = []
+        v = []
+
         for i in dia_len:
-            ll = features[0:1*i]
-            aa = features[1*i:2*i]
-            vv = features[2*i:3*i]
-            features = features[3*i:]
+            ll = features[0:1 * i]
+            aa = features[1 * i:2 * i]
+            vv = features[2 * i:3 * i]
+            features = features[3 * i:]
             l.append(ll)
             a.append(aa)
             v.append(vv)
-        tmpl = torch.cat(l,dim=0)
-        tmpa = torch.cat(a,dim=0)
-        tmpv = torch.cat(v,dim=0)
+
+        tmpl = torch.cat(l, dim=0)
+        tmpa = torch.cat(a, dim=0)
+        tmpv = torch.cat(v, dim=0)
         features = torch.cat([tmpl, tmpa, tmpv], dim=-1)
         return features

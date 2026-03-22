@@ -9,270 +9,144 @@ from model_GCN import GCN_2Layers, GCNLayer1, GCNII, TextCNN
 from model_hyper_our import HyperGCN
 import clip
 
-# ==========================================
-# [升级版] KANLinear: LayerNorm + GELU
-# ==========================================
-class KANLinear(nn.Module):
-    def __init__(
-        self,
-        in_features,
-        out_features,
-        grid_size=5,        # 保持默认 5
-        spline_order=3,     # 保持默认 3
-        scale_noise=0.1,
-        scale_base=1.0,
-        scale_spline=1.0,
-        enable_standalone_scale_spline=True,
-        base_activation=torch.nn.GELU, # [关键修改] 使用 GELU，更适合 Transformer 特征
-        grid_eps=0.02,
-        grid_range=[-1, 1],
-    ):
-        super(KANLinear, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.grid_size = grid_size
-        self.spline_order = spline_order
-
-        h = (grid_range[1] - grid_range[0]) / grid_size
-        grid = (
-            (
-                torch.arange(-spline_order, grid_size + spline_order + 1) * h
-                + grid_range[0]
-            )
-            .expand(in_features, -1)
-            .contiguous()
-        )
-        self.register_buffer("grid", grid)
-
-        self.base_weight = nn.Parameter(torch.Tensor(out_features, in_features))
-        self.spline_weight = nn.Parameter(
-            torch.Tensor(out_features, in_features, grid_size + spline_order)
-        )
-        if enable_standalone_scale_spline:
-            self.spline_scaler = nn.Parameter(
-                torch.Tensor(out_features, in_features)
-            )
-
-        self.scale_noise = scale_noise
-        self.scale_base = scale_base
-        self.scale_spline = scale_spline
-        self.enable_standalone_scale_spline = enable_standalone_scale_spline
-        self.base_activation = base_activation()
-        self.grid_eps = grid_eps
-
-        # [关键] LayerNorm 是必须的
-        self.layernorm = nn.LayerNorm(in_features)
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        torch.nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5) * self.scale_base)
-        with torch.no_grad():
-            noise = (
-                (
-                    torch.rand(self.grid_size + 1, self.in_features, self.out_features)
-                    - 1 / 2
-                )
-                * self.scale_noise
-                / self.grid_size
-            )
-            self.spline_weight.data.copy_(
-                (self.scale_spline if not self.enable_standalone_scale_spline else 1.0)
-                * self.curve2coeff(
-                    self.grid.T[self.spline_order : -self.spline_order],
-                    noise,
-                )
-            )
-            if self.enable_standalone_scale_spline:
-                torch.nn.init.constant_(self.spline_scaler, self.scale_spline)
-
-    def b_splines(self, x: torch.Tensor):
-        assert x.dim() == 2 and x.size(1) == self.in_features
-        grid: torch.Tensor = self.grid
-        x = x.unsqueeze(-1)
-        bases = ((x >= grid[:, :-1]) & (x < grid[:, 1:])).to(x.dtype)
-        for k in range(1, self.spline_order + 1):
-            bases = (
-                (x - grid[:, : -(k + 1)])
-                / (grid[:, k:-1] - grid[:, : -(k + 1)])
-                * bases[:, :, :-1]
-            ) + (
-                (grid[:, k + 1 :] - x)
-                / (grid[:, k + 1 :] - grid[:, 1:(-k)])
-                * bases[:, :, 1:]
-            )
-        assert bases.size() == (
-            x.size(0),
-            self.in_features,
-            self.grid_size + self.spline_order,
-        )
-        return bases
-
-    def curve2coeff(self, x: torch.Tensor, y: torch.Tensor):
-        A = self.b_splines(x).transpose(0, 1)
-        B = y.transpose(0, 1)
-        solution = torch.linalg.lstsq(A, B).solution
-        result = solution.permute(2, 0, 1)
-        return result.contiguous()
-
-    @property
-    def scaled_spline_weight(self):
-        return self.spline_weight * (
-            self.spline_scaler.unsqueeze(-1)
-            if self.enable_standalone_scale_spline
-            else 1.0
-        )
-
-    def forward(self, x: torch.Tensor):
-        # [关键] 应用 LayerNorm
-        x = self.layernorm(x)
-        assert x.dim() == 2 and x.size(1) == self.in_features
-        base_output = F.linear(self.base_activation(x), self.base_weight)
-        spline_output = F.linear(
-            self.b_splines(x).view(x.size(0), -1),
-            self.scaled_spline_weight.view(self.out_features, -1),
-        )
-        return base_output + spline_output
-
-# ==========================================
-# [策略一] Bottleneck KAN (备用)
-# ==========================================
-class BottleneckKAN(nn.Module):
-    def __init__(self, in_dim, out_dim, latent_dim=32, kan_hidden=16, grid_size=5):
-        super(BottleneckKAN, self).__init__()
-        self.compress = nn.Linear(in_dim, latent_dim)
-        self.ln = nn.LayerNorm(latent_dim)
-        self.kan = KANLinear(latent_dim, kan_hidden, grid_size=grid_size, base_activation=torch.nn.GELU)
-        self.expand = nn.Linear(kan_hidden, out_dim)
-        
-    def forward(self, x):
-        x = self.compress(x)
-        x = self.ln(x)
-        x = self.kan(x)
-        x = self.expand(x)
-        return x
-
 def print_grad(grad):
     print('the grad is', grad[2][0:5])
     return grad
 
 class FocalLoss(nn.Module):
-    def __init__(self, gamma = 2.5, alpha = 1, size_average = True):
-        super(FocalLoss, self).__init__()
+    def __init__(self, gamma=2.0, alpha=None, reduction='mean'):
+        super().__init__()
         self.gamma = gamma
         self.alpha = alpha
-        self.size_average = size_average
-        self.elipson = 0.000001
-    
-    def forward(self, logits, labels):
-        """
-        cal culates loss
-        logits: batch_size * labels_length * seq_length
-        labels: batch_size * seq_length
-        """
-        if labels.dim() > 2:
-            labels = labels.contiguous().view(labels.size(0), labels.size(1), -1)
-            labels = labels.transpose(1, 2)
-            labels = labels.contiguous().view(-1, labels.size(2)).squeeze()
-        if logits.dim() > 3:
-            logits = logits.contiguous().view(logits.size(0), logits.size(1), logits.size(2), -1)
-            logits = logits.transpose(2, 3)
-            logits = logits.contiguous().view(-1, logits.size(1), logits.size(3)).squeeze()
-        labels_length = logits.size(1)
-        seq_length = logits.size(0)
+        self.reduction = reduction
 
-        new_label = labels.unsqueeze(1)
-        label_onehot = torch.zeros([seq_length, labels_length]).cuda().scatter_(1, new_label, 1)
+    def forward(self, logits, target):
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = torch.exp(log_probs)
+        log_pt = log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
+        pt = probs.gather(1, target.unsqueeze(1)).squeeze(1)
 
-        log_p = F.log_softmax(logits,-1)
-        pt = label_onehot * log_p
-        sub_pt = 1 - pt
-        fl = -self.alpha * (sub_pt)**self.gamma * log_p
-        if self.size_average:
-            return fl.mean()
+        if self.alpha is not None:
+            at = self.alpha[target]
+            loss = -at * (1 - pt) ** self.gamma * log_pt
         else:
-            return fl.sum()
+            loss = -(1 - pt) ** self.gamma * log_pt
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
+
+# class FocalLoss(nn.Module):
+#     def __init__(self, gamma = 2.5, alpha = 1, size_average = True):
+#         super(FocalLoss, self).__init__()
+#         self.gamma = gamma
+#         self.alpha = alpha
+#         self.size_average = size_average
+#         self.elipson = 0.000001
+    
+#     def forward(self, logits, labels):
+#         """
+#         cal culates loss
+#         logits: batch_size * labels_length * seq_length
+#         labels: batch_size * seq_length
+#         """
+#         if labels.dim() > 2:
+#             labels = labels.contiguous().view(labels.size(0), labels.size(1), -1)
+#             labels = labels.transpose(1, 2)
+#             labels = labels.contiguous().view(-1, labels.size(2)).squeeze()
+#         if logits.dim() > 3:
+#             logits = logits.contiguous().view(logits.size(0), logits.size(1), logits.size(2), -1)
+#             logits = logits.transpose(2, 3)
+#             logits = logits.contiguous().view(-1, logits.size(1), logits.size(3)).squeeze()
+#         labels_length = logits.size(1)
+#         seq_length = logits.size(0)
+
+#         new_label = labels.unsqueeze(1)
+#         label_onehot = torch.zeros([seq_length, labels_length]).cuda().scatter_(1, new_label, 1)
+
+#         log_p = F.log_softmax(logits,-1)
+#         pt = label_onehot * log_p
+#         sub_pt = 1 - pt
+#         fl = -self.alpha * (sub_pt)**self.gamma * log_p
+#         if self.size_average:
+#             return fl.mean()
+#         else:
+#             return fl.sum()
+
+
+#     def forward(self, log_prob, target):
+#         # log_prob: [N, C]，已经是 log_softmax 后的输出
+#         # target:   [N]
+#         prob = torch.exp(log_prob)                      # [N, C]
+#         pt = prob.gather(1, target.unsqueeze(1)).squeeze(1)   # [N]
+#         log_pt = log_prob.gather(1, target.unsqueeze(1)).squeeze(1)
+
+#         focal_factor = (1 - pt).pow(self.gamma)
+
+#         if self.weight is not None:
+#             alpha_t = self.weight[target]
+#             loss = -alpha_t * focal_factor * log_pt
+#         else:
+#             loss = -focal_factor * log_pt
+
+#         if self.reduction == 'mean':
+#             return loss.mean()
+#         elif self.reduction == 'sum':
+#             return loss.sum()
+#         else:
+#             return loss
 
 class MaskedNLLLoss(nn.Module):
-
     def __init__(self, weight=None):
         super(MaskedNLLLoss, self).__init__()
         self.weight = weight
-        self.loss = nn.NLLLoss(weight=weight,
-                               reduction='sum')
+        self.loss = nn.NLLLoss(weight=weight, reduction='sum')
 
     def forward(self, pred, target, mask):
-        """
-        pred -> batch*seq_len, n_classes
-        target -> batch*seq_len
-        mask -> batch, seq_len
-        """
         mask_ = mask.view(-1,1)
         if type(self.weight)==type(None):
             loss = self.loss(pred*mask_, target)/torch.sum(mask)
         else:
-            loss = self.loss(pred*mask_, target)\
-                            /torch.sum(self.weight[target]*mask_.squeeze())
+            loss = self.loss(pred*mask_, target)/torch.sum(self.weight[target]*mask_.squeeze())
         return loss
 
-
 class MaskedMSELoss(nn.Module):
-
     def __init__(self):
         super(MaskedMSELoss, self).__init__()
         self.loss = nn.MSELoss(reduction='sum')
 
     def forward(self, pred, target, mask):
-        """
-        pred -> batch*seq_len
-        target -> batch*seq_len
-        mask -> batch*seq_len
-        """
         loss = self.loss(pred*mask, target)/torch.sum(mask)
         return loss
 
-
 class UnMaskedWeightedNLLLoss(nn.Module):
-
     def __init__(self, weight=None):
         super(UnMaskedWeightedNLLLoss, self).__init__()
         self.weight = weight
-        self.loss = nn.NLLLoss(weight=weight,
-                               reduction='sum')
+        self.loss = nn.NLLLoss(weight=weight, reduction='sum')
 
     def forward(self, pred, target):
-        """
-        pred -> batch*seq_len, n_classes
-        target -> batch*seq_len
-        """
         if type(self.weight)==type(None):
             loss = self.loss(pred, target)
         else:
-            loss = self.loss(pred, target)\
-                            /torch.sum(self.weight[target])
+            loss = self.loss(pred, target)/torch.sum(self.weight[target])
         return loss
 
-
 class SimpleAttention(nn.Module):
-
     def __init__(self, input_dim):
         super(SimpleAttention, self).__init__()
         self.input_dim = input_dim
         self.scalar = nn.Linear(self.input_dim,1,bias=False)
 
     def forward(self, M, x=None):
-        """
-        M -> (seq_len, batch, vector)
-        x -> dummy argument for the compatibility with MatchingAttention
-        """
         scale = self.scalar(M)
         alpha = F.softmax(scale, dim=0).permute(1,2,0)
         attn_pool = torch.bmm(alpha, M.transpose(0,1))[:,0,:]
         return attn_pool, alpha
 
-
 class MatchingAttention(nn.Module):
-
     def __init__(self, mem_dim, cand_dim, alpha_dim=None, att_type='general'):
         super(MatchingAttention, self).__init__()
         assert att_type!='concat' or alpha_dim!=None
@@ -289,11 +163,6 @@ class MatchingAttention(nn.Module):
             self.vector_prod = nn.Linear(alpha_dim, 1, bias=False)
 
     def forward(self, M, x, mask=None):
-        """
-        M -> (seq_len, batch, mem_dim)
-        x -> (batch, cand_dim) cand_dim == mem_dim?
-        mask -> (batch, seq_len)
-        """
         if type(mask)==type(None):
             mask = torch.ones(M.size(1), M.size(0)).type(M.type())
 
@@ -326,17 +195,8 @@ class MatchingAttention(nn.Module):
         attn_pool = torch.bmm(alpha, M.transpose(0,1))[:,0,:]
         return attn_pool, alpha
 
-
 class Attention(nn.Module):
     def __init__(self, embed_dim, hidden_dim=None, out_dim=None, n_head=1, score_function='dot_product', dropout=0):
-        ''' Attention Mechanism
-        :param embed_dim:
-        :param hidden_dim:
-        :param out_dim:
-        :param n_head: num of head (Multi-Head Attention)
-        :param score_function: scaled_dot_product / mlp (concat) / bi_linear (general dot)
-        :return (?, q_len, out_dim,)
-        '''
         super(Attention, self).__init__()
         if hidden_dim is None:
             hidden_dim = embed_dim // n_head
@@ -371,12 +231,6 @@ class Attention(nn.Module):
         mb_size = k.shape[0]
         k_len = k.shape[1]
         q_len = q.shape[1]
-        # k: (?, k_len, embed_dim,)
-        # q: (?, q_len, embed_dim,)
-        # kx: (n_head*?, k_len, hidden_dim)
-        # qx: (n_head*?, q_len, hidden_dim)
-        # score: (n_head*?, q_len, k_len,)
-        # output: (?, q_len, out_dim,)
         kx = self.w_k(k).view(mb_size, k_len, self.n_head, self.hidden_dim)
         kx = kx.permute(2, 0, 1, 3).contiguous().view(-1, k_len, self.hidden_dim)
         qx = self.w_q(q).view(mb_size, q_len, self.n_head, self.hidden_dim)
@@ -406,14 +260,9 @@ class Attention(nn.Module):
         output = self.dropout(output)
         return output, score
 
-
-
 class GRUModel(nn.Module):
-
     def __init__(self, D_m, D_e, D_h, n_classes=7, dropout=0.5):
-        
         super(GRUModel, self).__init__()
-        
         self.n_classes = n_classes
         self.dropout   = nn.Dropout(dropout)
         self.gru = nn.GRU(input_size=D_m, hidden_size=D_e, num_layers=2, bidirectional=True, dropout=dropout)
@@ -422,13 +271,8 @@ class GRUModel(nn.Module):
         self.smax_fc = nn.Linear(D_h, n_classes)
         
     def forward(self, U, qmask, umask, att2=True):
-        """
-        U -> seq_len, batch, D_m
-        qmask -> seq_len, batch, party
-        """
         emotions, hidden = self.gru(U)
         alpha, alpha_f, alpha_b = [], [], []
-        
         if att2:
             att_emotions = []
             alpha = []
@@ -440,18 +284,13 @@ class GRUModel(nn.Module):
             hidden = F.relu(self.linear(att_emotions))
         else:
             hidden = F.relu(self.linear(emotions))
-        
         hidden = self.dropout(hidden)
         log_prob = F.log_softmax(self.smax_fc(hidden), 2)
         return log_prob, alpha, alpha_f, alpha_b, emotions
 
-
 class LSTMModel(nn.Module):
-
     def __init__(self, D_m, D_e, D_h, n_classes=7, dropout=0.5):
-        
         super(LSTMModel, self).__init__()
-        
         self.n_classes = n_classes
         self.dropout   = nn.Dropout(dropout)
         self.lstm = nn.LSTM(input_size=D_m, hidden_size=D_e, num_layers=2, bidirectional=True, dropout=dropout)
@@ -460,13 +299,8 @@ class LSTMModel(nn.Module):
         self.smax_fc = nn.Linear(D_h, n_classes)
 
     def forward(self, U, qmask, umask, att2=True):
-        """
-        U -> seq_len, batch, D_m
-        qmask -> seq_len, batch, party
-        """
         emotions, hidden = self.lstm(U)
         alpha, alpha_f, alpha_b = [], [], []
-        
         if att2:
             att_emotions = []
             alpha = []
@@ -478,106 +312,9 @@ class LSTMModel(nn.Module):
             hidden = F.relu(self.linear(att_emotions))
         else:
             hidden = F.relu(self.linear(emotions))
-        
         hidden = self.dropout(hidden)
         log_prob = F.log_softmax(self.smax_fc(hidden), 2)
         return log_prob, alpha, alpha_f, alpha_b, emotions
-
-
-class MaskedEdgeAttention(nn.Module):
-
-    def __init__(self, input_dim, max_seq_len, no_cuda):
-        """
-        Method to compute the edge weights, as in Equation 1. in the paper. 
-        attn_type = 'attn1' refers to the equation in the paper.
-        For slightly different attention mechanisms refer to attn_type = 'attn2' or attn_type = 'attn3'
-        """
-
-        super(MaskedEdgeAttention, self).__init__()
-        
-        self.input_dim = input_dim
-        self.max_seq_len = max_seq_len
-        self.scalar = nn.Linear(self.input_dim, self.max_seq_len, bias=False)
-        self.matchatt = MatchingAttention(self.input_dim, self.input_dim, att_type='general2')
-        self.simpleatt = SimpleAttention(self.input_dim)
-        self.att = Attention(self.input_dim, score_function='mlp')
-        self.no_cuda = no_cuda
-
-    def forward(self, M, lengths, edge_ind):
-        """
-        M -> (seq_len, batch, vector)
-        lengths -> length of the sequences in the batch
-        edge_idn 
-        """
-        attn_type = 'attn1'
-
-        if attn_type == 'attn1':
-
-            scale = self.scalar(M)
-            alpha = F.softmax(scale, dim=0).permute(1, 2, 0)
-            if not self.no_cuda:
-                mask = Variable(torch.ones(alpha.size()) * 1e-10).detach().cuda()
-                mask_copy = Variable(torch.zeros(alpha.size())).detach().cuda()
-                
-            else:
-                mask = Variable(torch.ones(alpha.size()) * 1e-10).detach()
-                mask_copy = Variable(torch.zeros(alpha.size())).detach()
-            
-            edge_ind_ = []
-            for i, j in enumerate(edge_ind):
-                for x in j:
-                    edge_ind_.append([i, x[0], x[1]])
-
-            edge_ind_ = np.array(edge_ind_).transpose()
-            mask[edge_ind_] = 1
-            mask_copy[edge_ind_] = 1
-            masked_alpha = alpha * mask
-            _sums = masked_alpha.sum(-1, keepdim=True)
-            scores = masked_alpha.div(_sums) * mask_copy
-
-            return scores
-
-        elif attn_type == 'attn2':
-            scores = torch.zeros(M.size(1), self.max_seq_len, self.max_seq_len, requires_grad=True)
-
-            if not self.no_cuda:
-                scores = scores.cuda()
-
-
-            for j in range(M.size(1)):
-            
-                ei = np.array(edge_ind[j])
-
-                for node in range(lengths[j]):
-                
-                    neighbour = ei[ei[:, 0] == node, 1]
-
-                    M_ = M[neighbour, j, :].unsqueeze(1)
-                    t = M[node, j, :].unsqueeze(0)
-                    _, alpha_ = self.simpleatt(M_, t)
-                    scores[j, node, neighbour] = alpha_
-
-        elif attn_type == 'attn3':
-            scores = torch.zeros(M.size(1), self.max_seq_len, self.max_seq_len, requires_grad=True)
-
-            if not self.no_cuda:
-                scores = scores.cuda()
-
-            for j in range(M.size(1)):
-
-                ei = np.array(edge_ind[j])
-
-                for node in range(lengths[j]):
-
-                    neighbour = ei[ei[:, 0] == node, 1]
-
-                    M_ = M[neighbour, j, :].unsqueeze(1).transpose(0, 1)
-                    t = M[node, j, :].unsqueeze(0).unsqueeze(0).repeat(len(neighbour), 1, 1).transpose(0, 1)
-                    _, alpha_ = self.att(M_, t)
-                    scores[j, node, neighbour] = alpha_[0, :, 0]
-
-        return scores
-
 
 def pad(tensor, length, no_cuda):
     if isinstance(tensor, Variable):
@@ -598,7 +335,6 @@ def pad(tensor, length, no_cuda):
         else:
             return tensor
 
-
 def simple_batch_graphify(features, lengths, no_cuda):
     edge_index, edge_norm, edge_type, node_features = [], [], [], []
     batch_size = features.size(1)
@@ -606,15 +342,11 @@ def simple_batch_graphify(features, lengths, no_cuda):
         node_features.append(features[:lengths[j], j, :])
 
     node_features = torch.cat(node_features, dim=0)  
-
     if not no_cuda:
         node_features = node_features.cuda()
     return node_features, None, None, None, None
 
-
-
 class MMGatedAttention(nn.Module):
-
     def __init__(self, mem_dim, cand_dim, att_type='general'):
         super(MMGatedAttention, self).__init__()
         self.mem_dim = mem_dim
@@ -678,9 +410,24 @@ class MMGatedAttention(nn.Module):
                     return h_vl
             return torch.cat([h_av, h_al, h_vl],dim=-1)
 
+# =========================================================================
+# 恢复最初手写的 SimpleKAN 结构
+# =========================================================================
+class SimpleKAN(nn.Module):
+    def __init__(self, in_dim, out_dim, hidden_dim=128, dropout=0.1):
+        super(SimpleKAN, self).__init__()
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, out_dim)
+        self.dropout = nn.Dropout(dropout)
 
+    def forward(self, x):
+        x = self.fc1(x)
+        x = torch.sin(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
+        
 class Model(nn.Module):
-
     def __init__(self, base_model, D_m, D_g, D_p, D_e, D_h, D_a, graph_hidden_size, n_speakers, max_seq_len, window_past, window_future, 
                  n_classes=7, listener_state=False, context_attention='simple', dropout_rec=0.5, dropout=0.5, nodal_attention=True, avec=False, 
                  no_cuda=False, graph_type='relation', use_topic=False, alpha=0.2, multiheads=6, graph_construct='direct', use_GCN=False, use_residue=True,
@@ -702,10 +449,11 @@ class Model(nn.Module):
         self.use_residue = use_residue
         self.dynamic_edge_w = dynamic_edge_w
         self.return_feature = True
-        self.modals = [x for x in modals]  # a, v, l
+        self.modals = [x for x in modals]  
         self.use_speaker = use_speaker
         self.use_modal = use_modal
         self.att_type = att_type
+        
         self.normBNa = nn.BatchNorm1d(1024, affine=True)
         self.normBNb = nn.BatchNorm1d(1024, affine=True)
         self.normBNc = nn.BatchNorm1d(1024, affine=True)
@@ -726,54 +474,43 @@ class Model(nn.Module):
 
         if self.base_model == 'LSTM':
             if not self.multi_modal:
-                if len(self.modals) == 3:
-                    hidden_ = 250
-                elif ''.join(self.modals) == 'al':
-                    hidden_ = 150
-                elif ''.join(self.modals) == 'vl':
-                    hidden_ = 150
-                else:
-                    hidden_ = 100
+                if len(self.modals) == 3: hidden_ = 250
+                elif ''.join(self.modals) == 'al': hidden_ = 150
+                elif ''.join(self.modals) == 'vl': hidden_ = 150
+                else: hidden_ = 100
                 self.linear_ = nn.Linear(D_m, hidden_)
                 self.lstm = nn.LSTM(input_size=hidden_, hidden_size=D_e, num_layers=2, bidirectional=True, dropout=dropout)
             else:
                 if 'a' in self.modals:
                     hidden_a = D_g
                     self.linear_a = nn.Linear(D_m_a, hidden_a)
-                    if self.av_using_lstm:
-                        self.lstm_a = nn.LSTM(input_size=hidden_a, hidden_size=D_g//2, num_layers=2, bidirectional=True, dropout=dropout)
+                    if self.av_using_lstm: self.lstm_a = nn.LSTM(input_size=hidden_a, hidden_size=D_g//2, num_layers=2, bidirectional=True, dropout=dropout)
                 if 'v' in self.modals:
                     hidden_v = D_g
                     self.linear_v = nn.Linear(D_m_v, hidden_v)
-                    if self.av_using_lstm:
-                        self.lstm_v = nn.LSTM(input_size=hidden_v, hidden_size=D_g//2, num_layers=2, bidirectional=True, dropout=dropout)
+                    if self.av_using_lstm: self.lstm_v = nn.LSTM(input_size=hidden_v, hidden_size=D_g//2, num_layers=2, bidirectional=True, dropout=dropout)
                 if 'l' in self.modals:
                     hidden_l = D_g
-                    if self.use_bert_seq:
-                        self.txtCNN = TextCNN(input_dim=D_m, emb_size=hidden_l)
-                    else:
-                        self.linear_l = nn.Linear(D_m, hidden_l)
+                    if self.use_bert_seq: self.txtCNN = TextCNN(input_dim=D_m, emb_size=hidden_l)
+                    else: self.linear_l = nn.Linear(D_m, hidden_l)
                     self.lstm_l = nn.LSTM(input_size=hidden_l, hidden_size=D_g//2, num_layers=2, bidirectional=True, dropout=dropout)
 
         elif self.base_model == 'GRU':
-            #self.gru = nn.GRU(input_size=D_m, hidden_size=D_e, num_layers=2, bidirectional=True, dropout=dropout)
             if 'a' in self.modals:
                 hidden_a = D_g
                 self.linear_a = nn.Linear(D_m_a, hidden_a)
-                if self.av_using_lstm:
-                    self.gru_a = nn.GRU(input_size=hidden_a, hidden_size=D_g//2, num_layers=2, bidirectional=True, dropout=dropout)
+                if self.av_using_lstm: self.gru_a = nn.GRU(input_size=hidden_a, hidden_size=D_g//2, num_layers=2, bidirectional=True, dropout=dropout)
             if 'v' in self.modals:
                 hidden_v = D_g
                 self.linear_v = nn.Linear(D_m_v, hidden_v)
-                if self.av_using_lstm:
-                    self.gru_v = nn.GRU(input_size=hidden_v, hidden_size=D_g//2, num_layers=2, bidirectional=True, dropout=dropout)
+                if self.av_using_lstm: self.gru_v = nn.GRU(input_size=hidden_v, hidden_size=D_g//2, num_layers=2, bidirectional=True, dropout=dropout)
             if 'l' in self.modals:
                 hidden_l = D_g
-                if self.use_bert_seq:
-                    self.txtCNN = TextCNN(input_dim=D_m, emb_size=hidden_l)
-                else:
-                    self.linear_l = nn.Linear(D_m, hidden_l)
+                if self.use_bert_seq: self.txtCNN = TextCNN(input_dim=D_m, emb_size=hidden_l)
+                else: 
+                    if self.dataset!='MELD': self.linear_l = nn.Linear(D_m, hidden_l)
                 self.gru_l = nn.GRU(input_size=hidden_l, hidden_size=D_g//2, num_layers=2, bidirectional=True, dropout=dropout)
+                
         elif self.base_model == 'Transformer':
             if 'a' in self.modals:
                 hidden_a = D_g
@@ -785,38 +522,28 @@ class Model(nn.Module):
                 self.trans_v = nn.TransformerEncoderLayer(d_model=hidden_v, nhead=4)
             if 'l' in self.modals:
                 hidden_l = D_g
-                if self.use_bert_seq:
-                    self.txtCNN = TextCNN(input_dim=D_m, emb_size=hidden_l)
-                else:
-                    self.linear_l = nn.Linear(D_m, hidden_l)
+                if self.use_bert_seq: self.txtCNN = TextCNN(input_dim=D_m, emb_size=hidden_l)
+                else: self.linear_l = nn.Linear(D_m, hidden_l)
                 self.trans_l = nn.TransformerEncoderLayer(d_model=hidden_l, nhead=4)
-
 
         elif self.base_model == 'None':
             self.base_linear = nn.Linear(D_m, 2*D_e)
-
         else:
-            print ('Base model must be one of DialogRNN/LSTM/GRU')
             raise NotImplementedError 
-
-
 
         if self.graph_type=='hyper':
             self.graph_model = HyperGCN(a_dim=D_g, v_dim=D_g, l_dim=D_g, n_dim=D_g, nlayers=64, nhidden=graph_hidden_size, nclass=n_classes, 
                                         dropout=self.dropout, lamda=0.5, alpha=0.1, variant=True, return_feature=self.return_feature,
                                         use_residue=self.use_residue, n_speakers=n_speakers, modals=self.modals, use_speaker=self.use_speaker,
-                                        use_modal=self.use_modal, num_L=num_L, num_K=num_K)
+                                        use_modal=self.use_modal, num_L=num_L, num_K=num_K, dataset_name=dataset)
             print("construct "+self.graph_type)
         elif self.graph_type=='None':
             if not self.multi_modal:
                 self.graph_net = nn.Linear(2*D_e, n_classes)
             else:
-                if 'a' in self.modals:
-                    self.graph_net_a = nn.Linear(2*D_e, graph_hidden_size)
-                if 'v' in self.modals:
-                    self.graph_net_v = nn.Linear(2*D_e, graph_hidden_size)
-                if 'l' in self.modals:
-                    self.graph_net_l = nn.Linear(2*D_e, graph_hidden_size)
+                if 'a' in self.modals: self.graph_net_a = nn.Linear(2*D_e, graph_hidden_size)
+                if 'v' in self.modals: self.graph_net_v = nn.Linear(2*D_e, graph_hidden_size)
+                if 'l' in self.modals: self.graph_net_l = nn.Linear(2*D_e, graph_hidden_size)
             print("construct Bi-LSTM")
         else:
             print("There are no such kind of graph")
@@ -828,51 +555,45 @@ class Model(nn.Module):
                 edge_type_mapping[str(j) + str(k) + '1'] = len(edge_type_mapping)
 
         self.edge_type_mapping = edge_type_mapping
+        
         if self.multi_modal:
-            #self.gatedatt = MMGatedAttention(D_g + graph_hidden_size, graph_hidden_size, att_type='general')
             self.dropout_ = nn.Dropout(self.dropout)
             self.hidfc = nn.Linear(graph_hidden_size, n_classes)
+
+            # =========================================================================
+            # [恢复] 将终端分类器全部替换为你原本的 SimpleKAN
+            # =========================================================================
             if self.att_type == 'concat_subsequently':
                 if self.use_residue:
-                    # self.smax_fc = nn.Linear((D_g+graph_hidden_size)*len(self.modals), n_classes)
-                    # [创新点] 使用 KAN 替换分类头
-                    print("Using KANLinear (GELU) for classification head")
-                    self.smax_fc = KANLinear((D_g + graph_hidden_size * 2) * len(self.modals), n_classes)
+                    self.smax_fc = SimpleKAN((D_g + graph_hidden_size * 2) * len(self.modals), n_classes, hidden_dim=256, dropout=self.dropout)
                 else:
-                    self.smax_fc = KANLinear((graph_hidden_size)*len(self.modals), n_classes)
+                    self.smax_fc = SimpleKAN((graph_hidden_size) * len(self.modals), n_classes, hidden_dim=256, dropout=self.dropout)
             elif self.att_type == 'concat_DHT':
                 if self.use_residue:
-                    # [创新点] 替换核心分类层
-                    print("Using KANLinear (GELU) for classification head (concat_DHT)")
-                    self.smax_fc = KANLinear((D_g+graph_hidden_size*2)*len(self.modals), n_classes)
-                    # self.smax_fc = nn.Linear(3072, n_classes)
+                    self.smax_fc = SimpleKAN((D_g + graph_hidden_size * 2) * len(self.modals), n_classes, hidden_dim=256, dropout=self.dropout)
                 else:
-                    self.smax_fc = KANLinear((graph_hidden_size*2)*len(self.modals), n_classes)
-                    # self.smax_fc = nn.Linear(4608, n_classes)
+                    self.smax_fc = SimpleKAN((graph_hidden_size * 2) * len(self.modals), n_classes, hidden_dim=256, dropout=self.dropout)
             elif self.att_type == 'gated':
                 if len(self.modals) == 3:
-                    self.smax_fc = KANLinear(100*len(self.modals), graph_hidden_size)
+                    self.smax_fc = SimpleKAN(100 * len(self.modals), graph_hidden_size, hidden_dim=256, dropout=self.dropout)
                 else:
-                    self.smax_fc = KANLinear(100, graph_hidden_size)
+                    self.smax_fc = SimpleKAN(100, graph_hidden_size, hidden_dim=256, dropout=self.dropout)
             else:
-                self.smax_fc = nn.Linear(D_g+graph_hidden_size*len(self.modals), graph_hidden_size)
+                self.smax_fc = SimpleKAN(D_g + graph_hidden_size * len(self.modals), graph_hidden_size, hidden_dim=256, dropout=self.dropout)
 
 
     def _reverse_seq(self, X, mask):
         X_ = X.transpose(0,1)
         mask_sum = torch.sum(mask, 1).int()
-
         xfs = []
         for x, c in zip(X_, mask_sum):
             xf = torch.flip(x[:c], [0])
             xfs.append(xf)
-
         return pad_sequence(xfs)
 
 
     def forward(self, U, qmask, umask, seq_lengths, Sentence, clip_model, U_a=None, U_v=None, epoch=None):
 
-        #=============roberta features
         [r1,r2,r3,r4]=U
         seq_len, _, feature_dim = r1.size()
         if self.norm_strategy == 'LN':
@@ -891,12 +612,9 @@ class Model(nn.Module):
             r2 = norm2(r2.transpose(0, 1)).transpose(0, 1)
             r3 = norm2(r3.transpose(0, 1)).transpose(0, 1)
             r4 = norm2(r4.transpose(0, 1)).transpose(0, 1)
-        else:
-            pass
 
         U = (r1 + r2 + r3 + r4)/4
-        #U = torch.cat((textf,acouf),dim=-1)
-        #=============roberta features
+
         if self.base_model == 'LSTM':
             if not self.multi_modal:
                 U = self.linear_(U)
@@ -923,7 +641,6 @@ class Model(nn.Module):
                     emotions_l, hidden_l = self.lstm_l(U)
 
         elif self.base_model == 'GRU':
-            #emotions, hidden = self.gru(U)
             if 'a' in self.modals:
                 U_a = self.linear_a(U_a)
                 if self.av_using_lstm:
@@ -945,7 +662,6 @@ class Model(nn.Module):
                         pass
                     else:
                         U = self.linear_l(U)
-                #self.gru_l.flatten_parameters()
                 emotions_l, hidden_l = self.gru_l(U)
 
         elif self.base_model == 'Transformer':
@@ -986,11 +702,8 @@ class Model(nn.Module):
                 features_l, edge_index, edge_norm, edge_type, edge_index_lengths = simple_batch_graphify(emotions_l, seq_lengths, self.no_cuda)
             else:
                 features_l = []
+                
         if self.graph_type=='GCN3' or self.graph_type=='DeepGCN':
-            if self.use_topic:
-                topicLabel = [] 
-            else:
-                topicLabel = []
             if not self.multi_modal:
                 log_prob = self.graph_net(features, seq_lengths, qmask)
             else:
@@ -1007,17 +720,17 @@ class Model(nn.Module):
                     if len(emotions_l) != 0:
                         emotions.append(emotions_l)
                     emotions_feat = torch.cat(emotions, dim=-1)
-                #elif self.att_type == 'gated':
-                #    emotions_feat = self.gatedatt(emotions_a, emotions_v, emotions_l, self.modals)
                 else:
                     print("There is no such attention mechnism")
 
                 emotions_feat = self.dropout_(emotions_feat)
                 emotions_feat = nn.ReLU()(emotions_feat)
                 log_prob = F.log_softmax(self.hidfc(self.smax_fc(emotions_feat)), 1)
+                
         elif self.graph_type=='hyper':
             emotions_feat, neg_emotions_feat,  neg_emotions_feat2, neg_emotions_feat3 = self.graph_model(features_a, features_v, features_l, seq_lengths, qmask, epoch, Sentence)
 
+            # 直接送给 SimpleKAN 进行分类
             emotions_feat = self.dropout_(emotions_feat)
             emotions_feat = nn.ReLU()(emotions_feat)
             log_prob = F.log_softmax(self.smax_fc(emotions_feat), 1)
@@ -1036,4 +749,5 @@ class Model(nn.Module):
 
         else:
             print("There are no such kind of graph")
+            
         return log_prob, neg_log_prob, neg_log_prob2, neg_log_prob3, features_a, features_l,  features_v, edge_index, edge_norm, edge_type, edge_index_lengths

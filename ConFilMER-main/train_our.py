@@ -1,17 +1,20 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ["CUDA_LAUNCH_BLOCKING"] = "0" # 让报错的位置更加准确
+os.environ["CUDA_LAUNCH_BLOCKING"] = "0"  # 让报错的位置更加准确
+
 import numpy as np, argparse, time, pickle, random
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler, WeightedRandomSampler
+
 from dataloader_our import IEMOCAPDataset, MELDDataset
 from clip import load
 from utils import get_args, set_manualSeed, image_transform, WinoLoss, CLIPLoss, MarginLoss
 from model_our import MaskedNLLLoss, LSTMModel, GRUModel, Model, MaskedMSELoss, FocalLoss
 from sklearn.metrics import f1_score, confusion_matrix, accuracy_score, classification_report, precision_recall_fscore_support
+
 import pandas as pd
 import pickle as pk
 import datetime
@@ -30,7 +33,6 @@ def seed_everything(seed=seed):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
-
 def _init_fn(worker_id):
         np.random.seed(int(seed)+worker_id)
 
@@ -39,7 +41,6 @@ def get_train_valid_sampler(trainset, valid=0.1, dataset='IEMOCAP'):
     idx = list(range(size))
     split = int(valid*size)
     return SubsetRandomSampler(idx[split:]), SubsetRandomSampler(idx[:split])
-
 
 def get_MELD_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=False):
     trainset = MELDDataset('MELD_features/MELD_features_raw1.pkl')
@@ -67,7 +68,6 @@ def get_MELD_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=False):
                              pin_memory=pin_memory)
 
     return train_loader, valid_loader, test_loader
-
 
 def get_IEMOCAP_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=False):
     trainset = IEMOCAPDataset()
@@ -97,9 +97,6 @@ def get_IEMOCAP_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=Fals
 
 
 def train_or_eval_model(model, loss_function, dataloader, epoch, optimizer=None, train=False):
-    """
-    针对非图模型（如纯 LSTM/GRU）的训练/评估函数
-    """
     losses, preds, labels, masks = [], [], [], []
     alphas, alphas_f, alphas_b, vids = [], [], [], []
     max_sequence_len = []
@@ -116,13 +113,6 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, optimizer=None,
             optimizer.zero_grad()
         
         textf, visuf, acouf, qmask, umask, label = [d.cuda() for d in data[:-1]] if cuda else data[:-1]        
-
-        # [新增] 数据增强：仅在训练模式下注入噪声
-        if train:
-            noise_std = 0.05  # 噪声强度 5%
-            if torch.is_tensor(visuf): visuf = visuf + noise_std * torch.randn_like(visuf)
-            if torch.is_tensor(acouf): acouf = acouf + noise_std * torch.randn_like(acouf)
-            if torch.is_tensor(textf): textf = textf + noise_std * torch.randn_like(textf)
 
         max_sequence_len.append(textf.size(0))
         
@@ -164,9 +154,6 @@ def train_or_eval_model(model, loss_function, dataloader, epoch, optimizer=None,
 
 
 def train_or_eval_graph_model(model, clip_model, loss_function, dataloader, epoch, cuda, modals, optimizer=None, train=False, dataset='IEMOCAP'):
-    """
-    针对图模型（如 HyperGCN）的训练/评估函数
-    """
     losses, preds, labels = [], [], []
     scores, vids = [], []
 
@@ -188,18 +175,6 @@ def train_or_eval_graph_model(model, clip_model, loss_function, dataloader, epoc
             optimizer.zero_grad()
         
         textf1,textf2,textf3,textf4, visuf, acouf, qmask, umask, label, Sentence= [d.cuda() if torch.is_tensor(d)  else d for d in data[:-1]] if cuda else data[:-1]
-        
-        # [新增] 数据增强：仅在训练模式下注入噪声
-        # 这有助于防止 KAN 和复杂图网络过拟合
-        if train:
-            noise_std = 0.05 # 噪声强度设为 0.05 (5%)
-            if torch.is_tensor(visuf): visuf = visuf + noise_std * torch.randn_like(visuf)
-            if torch.is_tensor(acouf): acouf = acouf + noise_std * torch.randn_like(acouf)
-            # 对文本特征的四个部分分别加噪
-            if torch.is_tensor(textf1): textf1 = textf1 + noise_std * torch.randn_like(textf1)
-            if torch.is_tensor(textf2): textf2 = textf2 + noise_std * torch.randn_like(textf2)
-            if torch.is_tensor(textf3): textf3 = textf3 + noise_std * torch.randn_like(textf3)
-            if torch.is_tensor(textf4): textf4 = textf4 + noise_std * torch.randn_like(textf4)
 
         if args.multi_modal:
             if args.mm_fusion_mthd=='concat':
@@ -232,45 +207,42 @@ def train_or_eval_graph_model(model, clip_model, loss_function, dataloader, epoc
             log_prob, neg_log_prob, neg_log_prob2, neg_log_prob3, features_a, features_l, features_v, e_i, e_n, e_t, e_l = model([textf1,textf2,textf3,textf4], qmask, umask, lengths, Sentence, clip_model, acouf, visuf, epoch)
         elif args.multi_modal and args.mm_fusion_mthd=='concat_DHT':
             log_prob, neg_log_prob, neg_log_prob2, neg_log_prob3, features_a, features_l, features_v, e_i, e_n, e_t, e_l = model([textf1,textf2,textf3,textf4], qmask, umask, lengths, Sentence, clip_model, acouf, visuf, epoch)
-            # log_prob, features_a, features_l, features_v, e_i, e_n, e_t, e_l = model([textf1, textf2, textf3, textf4], qmask, umask, lengths, Sentence, clip_model, acouf, visuf, epoch)
         else:
             log_prob, e_i, e_n, e_t, e_l = model(textf, qmask, umask, lengths)
+        
         label = torch.cat([label[j][:lengths[j]] for j in range(len(label))])
+        
         loss = loss_function(log_prob, label)
         loss2 = loss_function(neg_log_prob, label)
         loss3 = loss_function(neg_log_prob2, label)
         loss4 = loss_function(neg_log_prob3, label)
+        
         '''对比 loss'''
-        temperature = 0.5
+        temperature = args.temp if hasattr(args, 'temp') else 0.5 
         audio_features = F.normalize(features_a, dim=-1)
         visual_features = F.normalize(features_v, dim=-1)
         text_features = F.normalize(features_l, dim=-1)
+        
         logits = torch.matmul(visual_features, text_features.t()) / temperature
         labels_ = torch.arange(logits.size(0)).to(logits.device)
         l = (F.cross_entropy(logits, labels_) + F.cross_entropy(logits.t(), labels_)) / 2
+        
         logits2 = torch.matmul(audio_features, text_features.t()) / temperature
         labels_2 = torch.arange(logits2.size(0)).to(logits2.device)
         l2 = (F.cross_entropy(logits2, labels_2) + F.cross_entropy(logits2.t(), labels_2)) / 2
 
-        loss = loss+loss2+loss3+loss4+l+l2
-        
-        # [保留] L1 稀疏正则化 (如果在参数中启用)
-        if train and args.l1 > 0:
-            l1_reg = 0.0
-            for name, param in model.named_parameters():
-                if 'spline_weight' in name:
-                    l1_reg += torch.norm(param, 1)
-            loss = loss + args.l1 * l1_reg
-        
+        lambda_cl = args.lambda_cl if hasattr(args, 'lambda_cl') else 1.0
+        lambda_neg = args.lambda_neg if hasattr(args, 'lambda_neg') else 1.0
+
+        loss = loss + lambda_neg * (loss2 + loss3 + loss4) + lambda_cl * (l + l2)
+
         preds.append(torch.argmax(log_prob, 1).cpu().numpy())
         labels.append(label.cpu().numpy())
         losses.append(loss.item())
+        vids += data[-1]
         if train:
             loss.backward()
             optimizer.step()
-            # [新增] 手动清理显存，防止在小显存GPU上出现 OOM
-            torch.cuda.empty_cache()
-            
 
     if preds!=[]:
         preds  = np.concatenate(preds)
@@ -278,7 +250,7 @@ def train_or_eval_graph_model(model, clip_model, loss_function, dataloader, epoc
     else:
         return float('nan'), float('nan'), [], [], float('nan'), float('nan'), float('nan'), [], [], [], [], []
 
-    vids += data[-1]
+    # vids += data[-1]
     ei = ei.data.cpu().numpy()
     et = et.data.cpu().numpy()
     en = en.data.cpu().numpy()
@@ -302,79 +274,46 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--no-cuda', action='store_true', default=False, help='does not use GPU')
-
     parser.add_argument('--base-model', default='LSTM', help='base recurrent model, must be one of DialogRNN/LSTM/GRU')
-
     parser.add_argument('--graph-model', action='store_true', default=True, help='whether to use graph model after recurrent encoding')
-
     parser.add_argument('--nodal-attention', action='store_true', default=True, help='whether to use nodal attention in graph model: Equation 4,5,6 in Paper')
-
-    parser.add_argument('--windowp', type=int, default=10, help='context window size for constructing edges in graph model for past utterances')
-
-    parser.add_argument('--windowf', type=int, default=10, help='context window size for constructing edges in graph model for future utterances')
-
+    parser.add_argument('--windowp', type=int, default=7, help='context window size for constructing edges in graph model for past utterances')
+    parser.add_argument('--windowf', type=int, default=7, help='context window size for constructing edges in graph model for future utterances')
     parser.add_argument('--lr', type=float, default=0.0001, metavar='LR', help='learning rate')
-    
-    # [参数微调] 默认 L2 正则化
     parser.add_argument('--l2', type=float, default=3e-05, metavar='L2', help='L2 regularization weight')
-    
-    # [新增] L1 正则化系数 (默认关闭 0.0)
     parser.add_argument('--l1', type=float, default=0.0, help='L1 regularization weight for KAN splines')
-    
     parser.add_argument('--rec-dropout', type=float, default=0.1, metavar='rec_dropout', help='rec_dropout rate')
-    
-    # [参数微调] 默认 Dropout
     parser.add_argument('--dropout', type=float, default=0.5, metavar='dropout', help='dropout rate')
-    
     parser.add_argument('--batch-size', type=int, default=32, metavar='BS', help='batch size')
-    
     parser.add_argument('--epochs', type=int, default=60, metavar='E', help='number of epochs')
-    
     parser.add_argument('--class-weight', action='store_true', default=True, help='use class weights')
-    
     parser.add_argument('--active-listener', action='store_true', default=False, help='active listener')
-
     parser.add_argument('--attention', default='general', help='Attention type in DialogRNN model')
-    
     parser.add_argument('--tensorboard', action='store_true', default=False, help='Enables tensorboard log')
-
     parser.add_argument('--graph_type', default='hyper', help='relation/GCN3/DeepGCN/MMGCN/MMGCN2')
-
     parser.add_argument('--use_topic', action='store_true', default=False, help='whether to use topic information')
-
     parser.add_argument('--alpha', type=float, default=0.2, help='alpha')
-
-    parser.add_argument('--multiheads', type=int, default=6, help='multiheads')# 6
-
+    parser.add_argument('--multiheads', type=int, default=6, help='multiheads')
     parser.add_argument('--graph_construct', default='full', help='single/window/fc for MMGCN2; direct/full for others')
-
     parser.add_argument('--use_gcn', action='store_true', default=True, help='whether to combine spectral and none-spectral methods or not')
-
     parser.add_argument('--use_residue', action='store_true', default=True, help='whether to use residue information or not')
-
     parser.add_argument('--multi_modal', action='store_true', default=True, help='whether to use multimodal information')
-
-    parser.add_argument('--mm_fusion_mthd', default='concat_subsequently', help='method to use multimodal information: concat, gated, concat_subsequently')
-
+    parser.add_argument('--mm_fusion_mthd', default='concat_subsequently', help='method to use multimodal information')
     parser.add_argument('--modals', default='avl', help='modals to fusion')
-
     parser.add_argument('--av_using_lstm', action='store_true', default=False, help='whether to use lstm in acoustic and visual modality')
-
     parser.add_argument('--Deep_GCN_nlayers', type=int, default=4, help='Deep_GCN_nlayers')
-
     parser.add_argument('--Dataset', default='IEMOCAP', help='dataset to train and test')
-
     parser.add_argument('--use_speaker', action='store_true', default=True, help='whether to use speaker embedding')
-
-    parser.add_argument('--use_modal', action='store_true', default=False, help='whether to use modal embedding') # IEMOCAP：False, MELD: True
-
+    parser.add_argument('--use_modal', action='store_true', default=False, help='whether to use modal embedding')
     parser.add_argument('--norm', default='LN2', help='NORM type')
-
     parser.add_argument('--testing', action='store_true', default=False, help='testing')
+    parser.add_argument('--num_L', type=int, default=3, help='num_hyperconvs')
+    parser.add_argument('--num_K', type=int, default=2, help='num_convs')
 
-    parser.add_argument('--num_L', type=int, default=3, help='num_hyperconvs') # 3
-
-    parser.add_argument('--num_K', type=int, default=2, help='num_convs') # 4
+    # 保留对比学习相关的参数
+    parser.add_argument('--temp', type=float, default=0.07, help='temperature for contrastive loss')
+    parser.add_argument('--lambda_cl', type=float, default=1.0, help='weight for contrastive loss (v-t + a-t)')
+    parser.add_argument('--lambda_neg', type=float, default=1.0, help='weight for negative losses (loss2+loss3+loss4)')
 
     args = parser.parse_args()
     today = datetime.datetime.now()
@@ -477,7 +416,8 @@ if __name__ == '__main__':
                                  use_modal=args.use_modal,
                                  norm = args.norm,
                                  num_L = args.num_L,
-                                 num_K = args.num_K)
+                                 num_K = args.num_K,
+                                 )
 
         print ('Graph NN with', args.base_model, 'as base model.')
         name = 'Graph'
@@ -489,7 +429,6 @@ if __name__ == '__main__':
                               dropout=args.dropout)
 
             print ('Basic GRU Model.')
-
 
         elif args.base_model == 'LSTM':
             model = LSTMModel(D_m, D_e, D_h, 
@@ -520,8 +459,7 @@ if __name__ == '__main__':
     else:
         if args.class_weight:
             if args.graph_model:
-                #loss_function = FocalLoss()
-                loss_function  = nn.NLLLoss(loss_weights.cuda() if cuda else loss_weights)
+                 loss_function = nn.NLLLoss(loss_weights.cuda() if cuda else loss_weights)
             else:
                 loss_function  = MaskedNLLLoss(loss_weights.cuda() if cuda else loss_weights)
         else:
@@ -532,7 +470,6 @@ if __name__ == '__main__':
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.l2)
     
-    # [保留] 学习率调度器
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
         mode='min', 
@@ -561,7 +498,7 @@ if __name__ == '__main__':
         state = torch.load("best_model.pth.tar")
         model.load_state_dict(state)
         print('testing loaded model')
-        test_loss, test_acc, test_label, test_pred, test_fscore, _, _, _, _, _ = train_or_eval_graph_model(model, loss_function, test_loader, 0, cuda, args.modals, dataset=args.Dataset)
+        test_loss, test_acc, test_label, test_pred, test_fscore, _, _, _, _, _ = train_or_eval_graph_model(model, clip_model, loss_function, test_loader, 0, cuda, args.modals, dataset=args.Dataset)
         print('test_acc:',test_acc,'test_fscore:',test_fscore)
 
     for e in range(n_epochs):
@@ -576,9 +513,7 @@ if __name__ == '__main__':
             all_macro_fscore.append(test_avg_macro_fscore)
             all_acc.append(test_acc)
             
-            # [保留] 更新学习率
             scheduler.step(train_loss)
-
 
         else:
             train_loss, train_acc, _, _, _, train_fscore, _ = train_or_eval_model(model, loss_function, train_loader, e, optimizer, True)
@@ -586,7 +521,6 @@ if __name__ == '__main__':
             test_loss, test_acc, test_label, test_pred, test_mask, test_fscore, attentions = train_or_eval_model(model, loss_function, test_loader, e)
             all_fscore.append(test_fscore)
             
-            # [保留] 更新学习率
             scheduler.step(train_loss)
 
         if best_loss == None or best_loss > test_loss:
@@ -595,7 +529,6 @@ if __name__ == '__main__':
         if best_fscore == None or best_fscore < test_fscore:
             best_fscore = test_fscore
             best_label, best_pred = test_label, test_pred
-            #test_loss, test_acc, test_label, test_pred, test_fscore, _, _, _, _, _ = train_or_eval_graph_model(model, loss_function, test_loader, e, cuda, args.modals, dataset=args.Dataset)
 
         if args.tensorboard:
             writer.add_scalar('test: accuracy', test_acc, e)
@@ -603,42 +536,53 @@ if __name__ == '__main__':
             writer.add_scalar('train: accuracy', train_acc, e)
             writer.add_scalar('train: fscore', train_fscore, e)
 
-        print('epoch: {}, train_loss: {}, train_acc: {}, train_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'.\
-                format(e+1, train_loss, train_acc, train_fscore, test_loss, test_acc, test_fscore, round(time.time()-start_time, 2)))
-        if (e+1)%10 == 0:
+        print('epoch: {}, train_loss: {}, train_acc: {}, train_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'.format(
+                e + 1, train_loss, train_acc, train_fscore, test_loss, test_acc, test_fscore, round(time.time() - start_time, 2)
+            ))
+
+        if (e + 1) % 10 == 0:
             print('best Weight-F-Score:', max(all_fscore))
-            print('best Miceo-F-Score:', max(all_micro_fscore))
-            print('best Macro-F-Score:', max(all_macro_fscore))
-            print('best Acc-Score:', max(all_acc))
-            print(classification_report(best_label, best_pred, sample_weight=best_mask, digits=4))
-            print(confusion_matrix(best_label, best_pred, sample_weight=best_mask))
-        
-    
+            if args.graph_model:
+                print('best Miceo-F-Score:', max(all_micro_fscore))
+                print('best Macro-F-Score:', max(all_macro_fscore))
+                print('best Acc-Score:', max(all_acc))
+                print(classification_report(best_label, best_pred, digits=4))
+                print(confusion_matrix(best_label, best_pred))
+            else:
+                print(classification_report(best_label, best_pred, sample_weight=best_mask, digits=4))
+                print(confusion_matrix(best_label, best_pred, sample_weight=best_mask))
 
     if args.tensorboard:
         writer.close()
+        
     if not args.testing:
         print('Test performance..')
         print('Wetight-F-Score:', max(all_fscore))
-        print('Miceo-F-Score:', max(all_micro_fscore))
-        print('Macro-F-Score:', max(all_macro_fscore))
-        print('Acc-Score:', max(all_acc))  # 平均准确率
-        # if not os.path.exists("record_{}_{}_{}.pk".format(today.year, today.month, today.day)):
-        #     with open("record_{}_{}_{}.pk".format(today.year, today.month, today.day),'wb') as f:
-        #         pk.dump({}, f)
-        # with open("record_{}_{}_{}.pk".format(today.year, today.month, today.day), 'rb') as f:
-        #     record = pk.load(f)
-        # key_ = name_
-        # if record.get(key_, False):
-        #     record[key_].append(max(all_fscore))
-        # else:
-        #     record[key_] = [max(all_fscore)]
-        # if record.get(key_+'record', False):
-        #     record[key_+'record'].append(classification_report(best_label, best_pred, sample_weight=best_mask,digits=4))
-        # else:
-        #     record[key_+'record'] = [classification_report(best_label, best_pred, sample_weight=best_mask,digits=4)]
-        # with open("record_{}_{}_{}.pk".format(today.year, today.month, today.day),'wb') as f:
-        #     pk.dump(record, f)
+        if args.graph_model:
+            print('Miceo-F-Score:', max(all_micro_fscore))
+            print('Macro-F-Score:', max(all_macro_fscore))
+            print('Acc-Score:', max(all_acc))
+            
+            # [恢复] 记录训练输出字典的逻辑
+            if not os.path.exists("record_{}_{}_{}.pk".format(today.year, today.month, today.day)):
+                with open("record_{}_{}_{}.pk".format(today.year, today.month, today.day),'wb') as f:
+                    pk.dump({}, f)
+            with open("record_{}_{}_{}.pk".format(today.year, today.month, today.day), 'rb') as f:
+                record = pk.load(f)
+            key_ = name_
+            if record.get(key_, False):
+                record[key_].append(max(all_fscore))
+            else:
+                record[key_] = [max(all_fscore)]
+            if record.get(key_+'record', False):
+                record[key_+'record'].append(classification_report(best_label, best_pred, digits=4))
+            else:
+                record[key_+'record'] = [classification_report(best_label, best_pred, digits=4)]
+            with open("record_{}_{}_{}.pk".format(today.year, today.month, today.day),'wb') as f:
+                pk.dump(record, f)
 
-        print(classification_report(best_label, best_pred, sample_weight=best_mask,digits=4))
-        print(confusion_matrix(best_label,best_pred,sample_weight=best_mask))
+            print(classification_report(best_label, best_pred, digits=4))
+            print(confusion_matrix(best_label, best_pred))
+        else:
+            print(classification_report(best_label, best_pred, sample_weight=best_mask, digits=4))
+            print(confusion_matrix(best_label, best_pred, sample_weight=best_mask))
